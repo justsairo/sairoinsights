@@ -1,0 +1,201 @@
+{
+  "name": "Sairo Insights - Data + News Export & Gmail",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "sched-1",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/api/news/webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer REPLACE_WITH_ADMIN_API_KEY"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-post-1",
+      "name": "Trigger Sairo News Sync",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [670, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:8000/api/news/export-csv",
+        "responseFormat": "file",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer REPLACE_WITH_ADMIN_API_KEY"
+            }
+          ]
+        },
+        "options": {
+          "download": true
+        }
+      },
+      "id": "http-get-csv",
+      "name": "Fetch News CSV Export",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [900, 250]
+    },
+    {
+      "parameters": {
+        "operation": "sendEmail",
+        "toEmail": "={{$env.NEWS_RECIPIENT_EMAIL || 'recipient@example.com'}}",
+        "subject": "Sairo Insights - Daily News Digest + Cleaned Data",
+        "textContent": "News articles and cleaned dataset export are attached.",
+        "attachmentPropertyName": "data"
+      },
+      "id": "gmail-1",
+      "name": "Send via Gmail (News + Data)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1150, 250]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/api/send-cleaned-via-gmail",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Dataset-Token",
+              "value": "REPLACE_WITH_DATASET_TOKEN"
+            }
+          ]
+        },
+        "bodyParametersUi": "json",
+        "bodyParameters": {
+          "json": {
+            "dataset_id": "REPLACE_WITH_DATASET_ID",
+            "recipient_email": "={{$env.DATA_RECIPIENT_EMAIL || 'data@example.com'}}",
+            "subject": "Your Cleaned Dataset",
+            "message": "Here is your cleaned and processed dataset from Sairo Insights."
+          }
+        }
+      },
+      "id": "http-post-gmail-data",
+      "name": "Send Cleaned Data via Gmail",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [900, 450]
+    },
+    {
+      "parameters": {
+        "operation": "appendEmail",
+        "toEmail": "={{$env.DATA_RECIPIENT_EMAIL || 'data@example.com'}}",
+        "subject": "Your Cleaned Dataset Ready",
+        "textContent": "Your dataset has been cleaned and is ready for download.",
+        "attachmentPropertyName": "data"
+      },
+      "id": "gmail-2",
+      "name": "Confirm Gmail Send (Data)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1150, 450]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "sheetId": "REPLACE_WITH_SHEET_ID",
+        "range": "Sheet1",
+        "options": {}
+      },
+      "id": "gsheets-1",
+      "name": "Append News to Google Sheet",
+      "type": "n8n-nodes-google.sheets",
+      "typeVersion": 1,
+      "position": [900, 620]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Trigger Sairo News Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Sairo News Sync": {
+      "main": [
+        [
+          {
+            "node": "Fetch News CSV Export",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Cleaned Data via Gmail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch News CSV Export": {
+      "main": [
+        [
+          {
+            "node": "Send via Gmail (News + Data)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Append News to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Cleaned Data via Gmail": {
+      "main": [
+        [
+          {
+            "node": "Confirm Gmail Send (Data)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "gmail-enhanced-1",
+  "meta": {
+    "instanceId": "local"
+  }
+}

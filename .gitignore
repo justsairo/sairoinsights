@@ -1,0 +1,7 @@
+app/backend/env/
+app/backend/data/
+app/frontend/node_modules/
+app/frontend/dist/
+__pycache__/
+*.pyc
+logs/
