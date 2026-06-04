@@ -21,12 +21,12 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Annotated, Literal
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, Depends
 from supabase import create_client, Client
 
 load_dotenv()
@@ -80,9 +80,6 @@ NEWS_AUTOMATION_TASK: asyncio.Task | None = None
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 SAMPLE_DATA = BASE_DIR / "sample_sales.csv"
-NEWS_DATA_DIR = BASE_DIR / "data"
-NEWS_ARTICLES_FILE = NEWS_DATA_DIR / "financial_news_articles.json"
-NEWS_MARKET_FILE = NEWS_DATA_DIR / "financial_market_latest.json"
 MAX_ARTICLES_STORED = 2000
 ARTICLE_TTL_DAYS = 90
 NEWS_AUTOMATION_ENABLED = os.getenv("NEWS_AUTOMATION_ENABLED", "false").lower() == "true"
@@ -322,7 +319,7 @@ def new_dataset_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def store_dataset(df: pd.DataFrame, access_token: str | None = None) -> tuple[str, str]:
+def store_dataset(df: pd.DataFrame, user_id: str, access_token: str | None = None) -> tuple[str, str]:
     dataset_id = str(uuid.uuid4())
     dataset_token = access_token or new_dataset_token()
 
@@ -330,10 +327,11 @@ def store_dataset(df: pd.DataFrame, access_token: str | None = None) -> tuple[st
         try:
             csv_data = df.to_csv(index=False).encode("utf-8")
             # 1. Upload to Storage (bucket: datasets)
-            supabase.storage.from_("datasets").upload(f"{dataset_id}.csv", csv_data, {"content-type": "text/csv"})
+            supabase.storage.from_("datasets").upload(f"{user_id}/{dataset_id}.csv", csv_data, {"content-type": "text/csv"})
             # 2. Store metadata in DB (table: datasets)
             supabase.table("datasets").insert({
                 "id": dataset_id,
+                "user_id": user_id,
                 "token": dataset_token
             }).execute()
             return dataset_id, dataset_token
@@ -345,16 +343,16 @@ def store_dataset(df: pd.DataFrame, access_token: str | None = None) -> tuple[st
     return dataset_id, dataset_token
 
 
-def get_dataset(dataset_id: str, dataset_token: str | None) -> pd.DataFrame:
+def get_dataset(dataset_id: str, user_id: str, dataset_token: str | None) -> pd.DataFrame:
     if STORAGE_BACKEND == "supabase" and supabase:
         try:
-            # 1. Verify token in DB
-            res = supabase.table("datasets").select("token").eq("id", dataset_id).single().execute()
+            # 1. Verify token and user_id in DB
+            res = supabase.table("datasets").select("token").eq("id", dataset_id).eq("user_id", user_id).single().execute()
             if not res or not res.data or not secrets.compare_digest(dataset_token or "", res.data.get("token", "")):
                  raise HTTPException(status_code=403, detail="You do not have access to this dataset")
             
             # 2. Download from Storage
-            file_data = supabase.storage.from_("datasets").download(f"{dataset_id}.csv")
+            file_data = supabase.storage.from_("datasets").download(f"{user_id}/{dataset_id}.csv")
             return pd.read_csv(io.BytesIO(file_data))
         except HTTPException:
             raise
@@ -542,12 +540,6 @@ def require_news_admin(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def news_file_init() -> None:
-    NEWS_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not NEWS_ARTICLES_FILE.exists():
-        NEWS_ARTICLES_FILE.write_text("[]", encoding="utf-8")
-
-
 def url_hash(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
 
@@ -638,58 +630,86 @@ async def fetch_market_snapshot() -> dict[str, Any]:
     return snapshot
 
 
-def read_articles_sync() -> list[dict[str, Any]]:
-    news_file_init()
+async def read_articles_sync() -> list[dict[str, Any]]:
+    if not supabase:
+        logger.warning("supabase_not_configured", extra={"event": "read_articles_sync_skipped"})
+        return []
     try:
-        data = json.loads(NEWS_ARTICLES_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
+        res = supabase.table("news_articles").select("*").order("timestamp", desc=True).execute()
+        return res.data if res.data else []
+    except Exception as e:
+        logger.error(f"supabase_read_articles_error: {e}")
         return []
 
 
-def write_articles_sync(articles: list[dict[str, Any]]) -> None:
-    news_file_init()
-    NEWS_ARTICLES_FILE.write_text(json.dumps(articles, indent=2), encoding="utf-8")
+async def write_articles_sync(articles: list[dict[str, Any]]) -> None:
+    if not supabase:
+        logger.warning("supabase_not_configured", extra={"event": "write_articles_sync_skipped"})
+        return
+    try:
+        # Supabase upsert (insert or update on conflict)
+        # Note: The 'id' field is used for conflict resolution
+        res = supabase.table("news_articles").upsert(articles, on_conflict="id").execute()
+        if res.data:
+            logger.info(f"supabase_upsert_articles_success: {len(res.data)} articles upserted.")
+        else:
+            logger.warning("supabase_upsert_articles_no_data: No data returned from upsert.")
+    except Exception as e:
+        logger.error(f"supabase_write_articles_error: {e}")
 
 
 async def store_news_articles(articles: list[dict[str, Any]], market: dict[str, Any]) -> int:
-    existing = await asyncio.to_thread(read_articles_sync)
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=ARTICLE_TTL_DAYS)).isoformat()
-    kept = [article for article in existing if article.get("timestamp", "") >= cutoff]
-    existing_ids = {article.get("id") for article in kept}
+    if not supabase:
+        logger.warning("supabase_not_configured", extra={"event": "store_news_articles_skipped"})
+        return 0
 
-    stored = 0
+    existing_res = await supabase.table("news_articles").select("id").execute()
+    existing_ids = {item["id"] for item in existing_res.data} if existing_res.data else set()
+
+    stored_articles = []
     market_fields = {key: value for key, value in market.items() if key != "timestamp"}
     for article in articles:
-        if article["id"] in existing_ids:
-            continue
-        kept.insert(0, {**article, **market_fields})
-        existing_ids.add(article["id"])
-        stored += 1
+        if article["id"] not in existing_ids:
+            stored_articles.append({**article, **market_fields})
 
-    kept = kept[:MAX_ARTICLES_STORED]
-    await asyncio.to_thread(write_articles_sync, kept)
-    NEWS_MARKET_FILE.write_text(json.dumps(market, indent=2), encoding="utf-8")
-    return stored
+    if stored_articles:
+        await write_articles_sync(stored_articles)
+
+    # Store market snapshot
+    try:
+        await supabase.table("market_snapshots").insert(market).execute()
+        logger.info("supabase_market_snapshot_stored", extra={"event": "market_snapshot_stored", "timestamp": market.get("timestamp")})
+    except Exception as e:
+        logger.error(f"supabase_store_market_snapshot_error: {e}")
+
+    return len(stored_articles)
 
 
 async def load_news_articles(days: int = 7) -> list[dict[str, Any]]:
     if days < 1 or days > 90:
         raise HTTPException(status_code=400, detail="days must be between 1 and 90")
+    if not supabase:
+        logger.warning("supabase_not_configured", extra={"event": "load_news_articles_skipped"})
+        return []
+    
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    articles = await asyncio.to_thread(read_articles_sync)
-    filtered = [article for article in articles if article.get("timestamp", "") >= cutoff]
-    filtered.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
-    return filtered
+    try:
+        res = supabase.table("news_articles").select("*").gte("pub_date", cutoff).order("timestamp", desc=True).execute()
+        return res.data if res.data else []
+    except Exception as e:
+        logger.error(f"supabase_load_news_articles_error: {e}")
+        return []
 
 
-def load_market_snapshot_sync() -> dict[str, Any]:
-    if not NEWS_MARKET_FILE.exists():
+async def load_market_snapshot_sync() -> dict[str, Any]:
+    if not supabase:
+        logger.warning("supabase_not_configured", extra={"event": "load_market_snapshot_sync_skipped"})
         return {}
     try:
-        data = json.loads(NEWS_MARKET_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, OSError):
+        res = supabase.table("market_snapshots").select("*").order("timestamp", desc=True).limit(1).single().execute()
+        return res.data if res.data else {}
+    except Exception as e:
+        logger.error(f"supabase_load_market_snapshot_error: {e}")
         return {}
 
 
@@ -835,7 +855,6 @@ async def news_automation_loop() -> None:
 @app.on_event("startup")
 async def start_news_automation() -> None:
     global NEWS_AUTOMATION_TASK
-    news_file_init()
     if NEWS_AUTOMATION_ENABLED and NEWS_AUTOMATION_TASK is None:
         NEWS_AUTOMATION_TASK = asyncio.create_task(news_automation_loop())
 
@@ -926,25 +945,26 @@ async def logout() -> dict[str, str]:
     """Logout (frontend handles token removal)."""
     return {"status": "logged out"}
 
-
-@app.get("/api/auth/verify")
-async def verify_token(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    """Verify JWT token and return user info."""
+async def get_current_user_id(authorization: Annotated[str | None, Header()] = None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
     token = authorization.replace("Bearer ", "")
     if not supabase:
-        if token.startswith("local_token_"):
-            email = token.replace("local_token_", "")
-            return {"user": {"id": "local", "email": email}}
-        raise HTTPException(status_code=401, detail="Invalid token")
-    
+        if token.startswith("local_token_"): # Local fallback for development
+            return "local_user_id"
+        raise HTTPException(status_code=401, detail="Supabase not configured, cannot verify token")
     try:
         user = supabase.auth.get_user(token)
-        return {"user": {"id": user.user.id, "email": user.user.email}}
+        if user and user.user:
+            return user.user.id
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+@app.get("/api/auth/verify")
+async def verify_token(user_id: Annotated[str, Depends(get_current_user_id)]) -> dict[str, Any]:
+    """Verify JWT token and return user info."""
+    return {"user": {"id": user_id, "email": "verified_email@example.com"}} # Email is placeholder for now
 
 
 @app.get("/api/health")
@@ -953,29 +973,36 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/sample")
-def load_sample() -> dict[str, Any]:
+def load_sample(user_id: Annotated[str, Depends(get_current_user_id)]) -> dict[str, Any]:
     df = pd.read_csv(SAMPLE_DATA)
     stored_df = coerce_columns(df)
-    dataset_id, dataset_token = store_dataset(stored_df)
+    dataset_id, dataset_token = store_dataset(stored_df, user_id)
     return summarize_frame(stored_df, dataset_id, dataset_token)
 
 
 @app.post("/api/upload")
-async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_dataset(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    file: UploadFile = File(...)
+) -> dict[str, Any]:
     data = await file.read()
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds 50MB limit")
     df = coerce_columns(parse_upload(file, data))
     validate_dataset_size(df)
-    dataset_id, dataset_token = store_dataset(df)
+    dataset_id, dataset_token = store_dataset(df, user_id)
     logger.info("dataset_uploaded", extra={"event": "dataset_uploaded"})
     return summarize_frame(df, dataset_id, dataset_token)
 
 
 @app.post("/api/clean")
-def clean_dataset(request: CleanRequest, x_dataset_token: str | None = Header(default=None)) -> dict[str, Any]:
+def clean_dataset(
+    request: CleanRequest, 
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    x_dataset_token: str | None = Header(default=None)
+) -> dict[str, Any]:
     record = get_dataset_record(request.dataset_id)
-    df = get_dataset(request.dataset_id, x_dataset_token)
+    df = get_dataset(request.dataset_id, user_id, x_dataset_token)
     before = {"rows": len(df), "missing": int(df.isna().sum().sum()), "duplicates": int(df.duplicated().sum())}
 
     if request.remove_duplicates:
@@ -1012,7 +1039,7 @@ def clean_dataset(request: CleanRequest, x_dataset_token: str | None = Header(de
                 mask &= pd.Series(z < 3, index=df.index).fillna(True)
         df = df[mask]
 
-    cleaned_id, _ = store_dataset(df, access_token=record.access_token)
+    cleaned_id, _ = store_dataset(df, user_id, access_token=record.access_token)
     after = {"rows": len(df), "missing": int(df.isna().sum().sum()), "duplicates": int(df.duplicated().sum())}
     result = summarize_frame(df, cleaned_id, record.access_token)
     result["before"] = before
@@ -1021,8 +1048,12 @@ def clean_dataset(request: CleanRequest, x_dataset_token: str | None = Header(de
 
 
 @app.post("/api/analyze")
-def analyze(request: AnalyzeRequest, x_dataset_token: str | None = Header(default=None)) -> dict[str, Any]:
-    df = get_dataset(request.dataset_id, x_dataset_token)
+def analyze(
+    request: AnalyzeRequest, 
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    x_dataset_token: str | None = Header(default=None)
+) -> dict[str, Any]:
+    df = get_dataset(request.dataset_id, user_id, x_dataset_token)
     numeric = list(df.select_dtypes(include=np.number).columns)
 
     if request.analysis_type == "describe":
@@ -1104,8 +1135,12 @@ def analyze(request: AnalyzeRequest, x_dataset_token: str | None = Header(defaul
 
 
 @app.post("/api/chart")
-def chart(request: ChartRequest, x_dataset_token: str | None = Header(default=None)) -> dict[str, Any]:
-    df = get_dataset(request.dataset_id, x_dataset_token)
+def chart(
+    request: ChartRequest, 
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    x_dataset_token: str | None = Header(default=None)
+) -> dict[str, Any]:
+    df = get_dataset(request.dataset_id, user_id, x_dataset_token)
     cols = [col for col in [request.x, request.y] if col]
     if not cols:
         raise HTTPException(status_code=400, detail="Select at least one chart column")
@@ -1120,8 +1155,12 @@ def chart(request: ChartRequest, x_dataset_token: str | None = Header(default=No
 
 
 @app.get("/api/insights/{dataset_id}")
-def insights(dataset_id: str, x_dataset_token: str | None = Header(default=None)) -> dict[str, Any]:
-    df = get_dataset(dataset_id, x_dataset_token)
+def insights(
+    dataset_id: str, 
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    x_dataset_token: str | None = Header(default=None)
+) -> dict[str, Any]:
+    df = get_dataset(dataset_id, user_id, x_dataset_token)
     numeric = list(df.select_dtypes(include=np.number).columns)
     items: list[str] = []
     if df.isna().sum().sum():
@@ -1245,10 +1284,11 @@ async def generate_complete_report(
 @app.post("/api/export-report-gmail")
 async def export_and_send_report(
     request: ExportCompleteReportRequest,
+    user_id: Annotated[str, Depends(get_current_user_id)],
     x_dataset_token: str | None = Header(default=None)
 ) -> dict[str, Any]:
     """Export cleaned data, analysis, insights, and news — send comprehensive report via Gmail."""
-    df = get_dataset(request.dataset_id, x_dataset_token)
+    df = get_dataset(request.dataset_id, user_id, x_dataset_token)
     
     # Get cleaned CSV
     csv_buffer = io.StringIO()
@@ -1380,9 +1420,13 @@ async def send_via_gmail(recipient: str, subject: str, message: str, csv_bytes: 
 
 
 @app.post("/api/send-cleaned-via-gmail")
-async def send_cleaned_via_gmail(request: SendViaGmailRequest, x_dataset_token: str | None = Header(default=None)) -> dict[str, Any]:
+async def send_cleaned_via_gmail(
+    request: SendViaGmailRequest, 
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    x_dataset_token: str | None = Header(default=None)
+) -> dict[str, Any]:
     """Send cleaned dataset via Gmail after cleaning."""
-    df = get_dataset(request.dataset_id, x_dataset_token)
+    df = get_dataset(request.dataset_id, user_id, x_dataset_token)
     
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
@@ -1436,10 +1480,17 @@ async def latest_news(limit: int = 20, days: int = 3, authorization: str | None 
 @app.get("/api/news/market")
 async def latest_market(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_news_admin(authorization)
-    market = await asyncio.to_thread(load_market_snapshot_sync)
+    market = await load_market_snapshot_sync()
     if not market:
         market = await fetch_market_snapshot()
-        NEWS_MARKET_FILE.write_text(json.dumps(market, indent=2), encoding="utf-8")
+        # If still no market, raise HTTP exception
+        if not market:
+            raise HTTPException(status_code=404, detail="No market data available")
+        # Store initial market snapshot if none existed
+        try:
+            await supabase.table("market_snapshots").insert(market).execute()
+        except Exception as e:
+            logger.error(f"supabase_initial_market_snapshot_store_error: {e}")
     return market
 
 
@@ -1447,7 +1498,7 @@ async def latest_market(authorization: str | None = Header(default=None)) -> dic
 async def trigger_news_email(days: int = 7, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_news_admin(authorization)
     articles = await load_news_articles(days)
-    market = await asyncio.to_thread(load_market_snapshot_sync)
+    market = await load_market_snapshot_sync()
     sent = await send_digest_email(articles, market, days)
     return {"sent": sent, "articles_in_digest": len(articles)}
 
