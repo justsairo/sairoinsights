@@ -14,6 +14,15 @@ module.exports = {
     {
       method: "shell.run",
       params: {
+        path: "app/backend-ts",
+        message: [
+          "npm install"
+        ]
+      }
+    },
+    {
+      method: "shell.run",
+      params: {
         path: "app/frontend",
         message: [
           "npm install",

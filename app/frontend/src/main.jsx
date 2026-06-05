@@ -18,12 +18,14 @@ import {
   Lock,
   Mail,
   ArrowRight,
-  CheckCircle2
+  CheckCircle2,
+  Table
 } from "lucide-react";
 import "./styles.css";
+import DataEditor from './components/DataEditor'; // Import DataEditor
 
 const API = (typeof process !== 'undefined' && process.env && process.env.REACT_APP_API_URL) || "";
-const steps = ["Upload", "Clean", "Analyze", "Visualize", "Insights", "News", "Automation"];
+const steps = ["Create Data", "Upload", "Clean", "Analyze", "Visualize", "Insights", "News", "Automation"];
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -354,6 +356,7 @@ function App() {
             </nav>
 
             <div className="md:col-span-4 space-y-5">
+              {step === "Create Data" && <DataEditor />}
               {step === "Upload" && <UploadStep onUpload={uploadFile} onSample={loadSample} dataset={dataset} />}
               {step === "Clean" && <CleanStep dataset={active} request={request} setCleaned={setCleaned} setStep={setStep} />}
               {step === "Analyze" && <AnalyzeStep dataset={active} request={request} analysis={analysis} setAnalysis={setAnalysis} />}
@@ -695,6 +698,11 @@ function NewsStep({ request, news, setNews }) {
 function AutomationStep({ dataset, request, insights, news }) {
   const [exportEmail, setExportEmail] = useState("");
   const [exportStatus, setExportStatus] = useState("");
+  const [includeCleanedCsv, setIncludeCleanedCsv] = useState(true);
+  const [includeAnalysis, setIncludeAnalysis] = useState(true);
+  const [includeCharts, setIncludeCharts] = useState(true); // New state for charts
+  const [includeInsights, setIncludeInsights] = useState(true);
+  const [includeNews, setIncludeNews] = useState(true);
   const [config, setConfig] = useState({ n8n_url: "http://localhost:5678", automation_enabled: false });
 
   useEffect(() => {
@@ -715,10 +723,11 @@ function AutomationStep({ dataset, request, insights, news }) {
         body: JSON.stringify({
           dataset_id: dataset.dataset_id,
           recipient_email: exportEmail,
-          include_cleaned_csv: true,
-          include_analysis: true,
-          include_insights: true,
-          include_news: !!news.articles?.length,
+          include_cleaned_csv: includeCleanedCsv,
+          include_analysis: includeAnalysis,
+          include_charts: includeCharts, // New field
+          include_insights: includeInsights,
+          include_news: includeNews && !!news.articles?.length, // Only if news articles exist
           subject: "Sairo Insights - Complete Analysis Report"
         })
       });
@@ -741,7 +750,7 @@ function AutomationStep({ dataset, request, insights, news }) {
             <Send size={20} /> Export & Send Complete Report via Gmail
           </h3>
           <p className="text-sm text-blue-800">Send all generated outputs (cleaned data, analysis, insights, news) as a ZIP archive.</p>
-          <div className="flex gap-2">
+          <div className="flex flex-col gap-2">
             <input 
               type="email" 
               value={exportEmail} 
@@ -749,7 +758,14 @@ function AutomationStep({ dataset, request, insights, news }) {
               placeholder="recipient@example.com"
               className="input flex-1"
             />
-            <button onClick={exportAndSendReport} className="btn-primary">Send Report</button>
+            <div className="grid grid-cols-2 gap-2 text-sm text-blue-800">
+              <label className="flex items-center gap-2"><input type="checkbox" checked={includeCleanedCsv} onChange={(e) => setIncludeCleanedCsv(e.target.checked)} /> Include Cleaned CSV</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={includeAnalysis} onChange={(e) => setIncludeAnalysis(e.target.checked)} /> Include Analysis</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={includeCharts} onChange={(e) => setIncludeCharts(e.target.checked)} /> Include Charts</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={includeInsights} onChange={(e) => setIncludeInsights(e.target.checked)} /> Include Insights</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={includeNews} onChange={(e) => setIncludeNews(e.target.checked)} /> Include News</label>
+            </div>
+            <button onClick={exportAndSendReport} className="btn-primary mt-2">Send Report</button>
           </div>
           {exportStatus && (
             <div className={`text-sm p-2 rounded ${exportStatus.startsWith("✓") ? "bg-green-100 text-green-800" : exportStatus.startsWith("✗") ? "bg-red-100 text-red-800" : "bg-blue-100 text-blue-800"}`}>
@@ -924,6 +940,71 @@ function ResultBlock({ result }) {
                   {result.result.map((row) => (
                     <td key={row.index} className="px-3 py-2 text-zinc-700">
                       {typeof row[metric] === "number" ? row[metric].toLocaleString(undefined, { maximumFractionDigits: 2 }) : row[metric]}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
+
+  if (result.type === "correlation") {
+    const columns = Object.keys(result.result);
+    return (
+      <div className="overflow-hidden rounded-md border border-zinc-200 bg-white">
+        <div className="border-b border-zinc-200 px-4 py-3 font-medium capitalize">
+          {result.method} Correlation Matrix
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-zinc-100">
+              <tr>
+                <th className="px-3 py-2 font-medium">Column</th>
+                {columns.map((col) => (
+                  <th key={col} className="px-3 py-2 font-medium">{col}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {columns.map((row) => (
+                <tr key={row}>
+                  <td className="bg-zinc-50 px-3 py-2 font-medium">{row}</td>
+                  {columns.map((col) => (
+                    <td key={col} className={`px-3 py-2 text-zinc-700 ${Math.abs(result.result[row][col]) > 0.7 ? "bg-blue-50 font-semibold" : ""}`}>
+                      {result.result[row][col].toFixed(3)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
+
+  if (result.type === "groupby") {
+    const columns = result.result.length > 0 ? Object.keys(result.result[0]) : [];
+    return (
+      <div className="overflow-hidden rounded-md border border-zinc-200 bg-white">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-zinc-100">
+              <tr>
+                {columns.map((col) => (
+                  <th key={col} className="px-3 py-2 font-medium">{col}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {result.result.map((row, i) => (
+                <tr key={i}>
+                  {columns.map((col) => (
+                    <td key={col} className="px-3 py-2 text-zinc-700">
+                      {typeof row[col] === "number" ? row[col].toLocaleString(undefined, { maximumFractionDigits: 2 }) : String(row[col])}
                     </td>
                   ))}
                 </tr>

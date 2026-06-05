@@ -38,6 +38,8 @@ from pydantic import BaseModel, Field
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
+import plotly.graph_objects as go
+import plotly.express as px
 
 try:
     import feedparser
@@ -218,6 +220,11 @@ class NewsCollectResponse(BaseModel):
     email_sent: bool
 
 
+class CreateDatasetEditorRequest(BaseModel):
+    data: str # JSON string or CSV string
+    format: Literal["json", "csv"]
+
+
 @app.middleware("http")
 async def rate_limit_and_log(request: Request, call_next):
     start = time.perf_counter()
@@ -314,6 +321,54 @@ def summarize_frame(df: pd.DataFrame, dataset_id: str, dataset_token: str | None
         summary["dataset_token"] = dataset_token
     return json_safe(summary)
 
+
+def build_plot_figure(df: pd.DataFrame, chart_type: str, x: str | None = None, y: str | None = None) -> go.Figure:
+    fig_title = ""
+    if x and y:
+        fig_title = f"{chart_type.capitalize()} of {x} vs {y}"
+    elif x:
+        fig_title = f"{chart_type.capitalize()} of {x}"
+    elif y:
+        fig_title = f"{chart_type.capitalize()} of {y}"
+
+    if chart_type == "histogram":
+        fig = px.histogram(df, x=x or y, title=fig_title)
+    elif chart_type == "box":
+        fig = px.box(df, y=y or x, title=fig_title)
+    elif chart_type == "bar" and x and y:
+        fig = px.bar(df, x=x, y=y, title=fig_title)
+    elif chart_type == "line" and x and y:
+        fig = px.line(df, x=x, y=y, title=fig_title)
+    elif chart_type == "scatter" and x and y:
+        fig = px.scatter(df, x=x, y=y, title=fig_title)
+    else:
+        # Default or fallback chart
+        if x and y and pd.api.types.is_numeric_dtype(df[x]) and pd.api.types.is_numeric_dtype(df[y]):
+            fig = px.scatter(df, x=x, y=y, title=fig_title)
+        elif x and pd.api.types.is_numeric_dtype(df[x]):
+            fig = px.histogram(df, x=x, title=fig_title)
+        elif y and pd.api.types.is_numeric_dtype(df[y]):
+            fig = px.histogram(df, y=y, title=fig_title)
+        else:
+            fig = go.Figure(layout=go.Layout(title=go.layout.Title(text="Default Chart"))) # Empty figure or a very basic one
+    
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=40, b=20),
+        height=400,
+        autosize=True,
+        title_x=0.5
+    )
+    return fig
+
+async def generate_chart_image(df: pd.DataFrame, chart_type: str, x: str | None = None, y: str | None = None) -> bytes:
+    try:
+        fig = build_plot_figure(df, chart_type, x, y)
+        img_bytes = await asyncio.to_thread(fig.to_image, format="png", width=800, height=500, scale=2)
+        return img_bytes
+    except Exception as e:
+        logger.error(f"chart_image_generation_error: {e}")
+        return b"" # Return empty bytes on error
 
 def new_dataset_token() -> str:
     return secrets.token_urlsafe(32)
@@ -995,6 +1050,32 @@ async def upload_dataset(
     return summarize_frame(df, dataset_id, dataset_token)
 
 
+@app.post("/api/create-dataset-from-editor")
+async def create_dataset_from_editor(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    request: CreateDatasetEditorRequest
+) -> dict[str, Any]:
+    if len(request.data.encode("utf-8")) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Data exceeds 50MB limit")
+    
+    df: pd.DataFrame
+    try:
+        if request.format == "json":
+            df = parse_json_upload(request.data.encode("utf-8"))
+        elif request.format == "csv":
+            df = pd.read_csv(io.StringIO(request.data))
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported format")
+    except Exception as e:
+        logger.error(f"create_dataset_parse_error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to parse data: {e}")
+
+    validate_dataset_size(df)
+    dataset_id, dataset_token = store_dataset(df, user_id)
+    logger.info("dataset_created_from_editor", extra={"event": "dataset_created_from_editor"})
+    return summarize_frame(df, dataset_id, dataset_token)
+
+
 @app.post("/api/clean")
 def clean_dataset(
     request: CleanRequest, 
@@ -1188,11 +1269,56 @@ def insights(
     return {"insights": items[:6]}
 
 
+def generate_ai_insights(df: pd.DataFrame, analysis_results: dict[str, Any], existing_insights: list[str]) -> list[str]:
+    """
+    Generates additional AI-like insights based on the DataFrame and analysis results.
+    Initially, this will be rule-based or simple statistical inferences.
+    """
+    ai_insights = []
+    
+    # Example: Insight based on dataset size
+    if len(df) > 5000:
+        ai_insights.append("AI Suggestion: Consider sampling or using distributed computing for very large datasets to improve performance.")
+    elif len(df) < 50:
+        ai_insights.append("AI Suggestion: The dataset is small. Be cautious with statistical inferences as they might not be representative.")
+
+    # Example: Insight based on high missing values
+    total_missing = df.isna().sum().sum()
+    if total_missing > (len(df) * len(df.columns) * 0.1): # More than 10% missing
+        ai_insights.append("AI Suggestion: High proportion of missing values detected. Thorough missing data imputation strategies (e.g., advanced MICE, KNN imputation) could be beneficial beyond simple mean/median/mode.")
+
+    # Example: Insight based on correlation analysis
+    if analysis_results and analysis_results.get("correlation"):
+        corr_matrix = analysis_results["correlation"].get("result", {})
+        strong_positive_corr = []
+        strong_negative_corr = []
+        for col1, corrs in corr_matrix.items():
+            for col2, val in corrs.items():
+                if col1 == col2:
+                    continue
+                if val > 0.8 and f"{col2}-{col1}" not in strong_positive_corr:
+                    strong_positive_corr.append(f"{col1}-{col2}")
+                if val < -0.8 and f"{col2}-{col1}" not in strong_negative_corr:
+                    strong_negative_corr.append(f"{col1}-{col2}")
+        if strong_positive_corr:
+            ai_insights.append(f"AI Suggestion: Strong positive correlations observed between: {', '.join(strong_positive_corr)}. Investigate potential multicollinearity or causal relationships.")
+        if strong_negative_corr:
+            ai_insights.append(f"AI Suggestion: Strong negative correlations observed between: {', '.join(strong_negative_corr)}. Explore inverse relationships or confounding factors.")
+            
+    # Example: Suggest further visualization for specific analysis types
+    if analysis_results and analysis_results.get("type") == "regression":
+        ai_insights.append("AI Suggestion: For regression analysis, consider a residual plot to check model assumptions and linearity.")
+    
+    # Combine existing and new insights, ensuring uniqueness and limiting length
+    final_insights = list(set(existing_insights + ai_insights))
+    return final_insights[:8] # Limit AI insights to a reasonable number to avoid clutter
+
 class ExportCompleteReportRequest(BaseModel):
     dataset_id: str
     recipient_email: str
     include_cleaned_csv: bool = True
     include_analysis: bool = True
+    include_charts: bool = True # New field
     include_insights: bool = True
     include_news: bool = True
     subject: str = "Sairo Insights - Complete Analysis Report"
@@ -1202,11 +1328,14 @@ async def generate_complete_report(
     dataset_id: str, 
     analysis: dict[str, Any] | None,
     insights: list[str] | None,
+    ai_insights: list[str] | None, # New parameter
     news_articles: list[dict] | None,
-    cleaned_csv_bytes: bytes | None
+    chart_images: dict[str, bytes] | None, # New parameter
+    cleaned_csv_bytes: bytes | None # Keeping for zip attachment, not direct HTML embed
 ) -> bytes:
     """Generate a comprehensive HTML report with all analysis outputs."""
     from datetime import datetime
+    import base64
     
     html_parts = [
         f"""
@@ -1223,6 +1352,8 @@ async def generate_complete_report(
                 th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
                 th {{ background: #f0f0f0; font-weight: 600; }}
                 .insight {{ background: #e3f2fd; border-left: 4px solid #2196f3; padding: 15px; margin: 10px 0; border-radius: 4px; }}
+                .ai-insight {{ background: #e0ffe0; border-left: 4px solid #4CAF50; padding: 15px; margin: 10px 0; border-radius: 4px; }}
+                .chart-container {{ text-align: center; margin: 20px 0; }}
                 .news-item {{ background: #f3e5f5; border-left: 4px solid #9c27b0; padding: 12px; margin: 8px 0; border-radius: 4px; }}
                 .footer {{ text-align: center; color: #999; font-size: 12px; margin-top: 40px; }}
             </style>
@@ -1242,12 +1373,18 @@ async def generate_complete_report(
                 <h2>📈 Analysis Results</h2>
         """)
         if isinstance(analysis, dict):
-            for key, value in analysis.items():
-                if key not in ["dataset_id", "dataset_token"]:
-                    if isinstance(value, dict):
-                        html_parts.append(f"<p><strong>{key}:</strong></p><pre>{json.dumps(value, indent=2)[:500]}</pre>")
-                    else:
-                        html_parts.append(f"<p><strong>{key}:</strong> {value}</p>")
+            # Convert analysis results to a more readable format if possible
+            if analysis.get("type") == "describe" and analysis.get("result"):
+                df_describe = pd.DataFrame(analysis["result"]).set_index("index")
+                html_parts.append(f"<h3>Descriptive Statistics</h3>{df_describe.to_html()}")
+            elif analysis.get("type") == "correlation" and analysis.get("result"):
+                df_corr = pd.DataFrame(analysis["result"])
+                html_parts.append(f"<h3>Correlation Matrix ({analysis.get('method', 'Pearson').capitalize()})</h3>{df_corr.to_html()}")
+            elif analysis.get("type") == "groupby" and analysis.get("result"):
+                df_groupby = pd.DataFrame(analysis["result"])
+                html_parts.append(f"<h3>Group By Results</h3>{df_groupby.to_html()}")
+            else: # Fallback for other analysis types
+                html_parts.append(f"<pre>{json.dumps(analysis, indent=2)}</pre>")
         html_parts.append("</div>")
     
     if insights:
@@ -1258,6 +1395,30 @@ async def generate_complete_report(
         for insight in insights:
             html_parts.append(f'<div class="insight">{html.escape(insight)}</div>')
         html_parts.append("</div>")
+
+    if ai_insights:
+        html_parts.append("""
+            <div class="section">
+                <h2>🤖 AI-Generated Insights</h2>
+        """)
+        for insight in ai_insights:
+            html_parts.append(f'<div class="ai-insight">{html.escape(insight)}</div>')
+        html_parts.append("</div>")
+
+    if chart_images:
+        html_parts.append("""
+            <div class="section">
+                <h2>📊 Visualizations</h2>
+        """)
+        for chart_name, img_bytes in chart_images.items():
+            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+            html_parts.append(f"""
+                <div class="chart-container">
+                    <h3>{html.escape(chart_name)}</h3>
+                    <img src="data:image/png;base64,{img_base64}" alt="{html.escape(chart_name)}" style="max-width: 100%; height: auto;">
+                </div>
+            """)
+        html_parts.append("</div>")
     
     if news_articles:
         html_parts.append(f"""
@@ -1265,9 +1426,17 @@ async def generate_complete_report(
                 <h2>📰 Latest News ({len(news_articles)} articles)</h2>
         """)
         for article in news_articles[:10]:
-            title = html.escape(article.get("title", "Untitled"))
+            title = html.escape(article.get("headline", "Untitled"))
             source = html.escape(article.get("source", "Unknown"))
-            html_parts.append(f'<div class="news-item"><strong>{title}</strong><br/><small>{source}</small></div>')
+            url = html.escape(article.get("url", "#"))
+            summary = html.escape(article.get("summary", "")[:200], quote=True) + "..." if article.get("summary") else ""
+            html_parts.append(f"""
+                <div class="news-item">
+                    <strong><a href="{url}" style="color:#1d4ed8;text-decoration:none;">{title}</a></strong><br/>
+                    <small>{source} - {article.get("pub_date", "")[:10]}</small>
+                    <p style="font-size:12px;color:#4b5563;">{summary}</p>
+                </div>
+            """)
         html_parts.append("</div>")
     
     html_parts.append("""
@@ -1287,29 +1456,81 @@ async def export_and_send_report(
     user_id: Annotated[str, Depends(get_current_user_id)],
     x_dataset_token: str | None = Header(default=None)
 ) -> dict[str, Any]:
-    """Export cleaned data, analysis, insights, and news — send comprehensive report via Gmail."""
+    """Export cleaned data, analysis, insights, charts, and news — send comprehensive report via Gmail."""
+    
+    # 1. Get cleaned dataset
     df = get_dataset(request.dataset_id, user_id, x_dataset_token)
     
-    # Get cleaned CSV
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
     cleaned_csv_bytes = csv_buffer.getvalue().encode("utf-8")
     
-    # Prepare analysis/insights/news (would be passed from frontend in real scenario)
-    analysis = None
-    insights = []
-    news_articles = []
+    # 2. Get Analysis (if included in request) - re-run simple describe for report
+    analysis_results = None
+    if request.include_analysis:
+        try:
+            analysis_request = AnalyzeRequest(dataset_id=request.dataset_id, analysis_type="describe")
+            analysis_results = analyze(analysis_request, user_id, x_dataset_token)
+        except Exception as e:
+            logger.warning(f"report_analysis_error: {e}")
+            analysis_results = {"error": f"Failed to generate analysis: {str(e)}"}
+
+    # 3. Get Insights (existing and AI-generated)
+    existing_insights = []
+    if request.include_insights:
+        try:
+            insights_payload = insights(request.dataset_id, user_id, x_dataset_token)
+            existing_insights = insights_payload.get("insights", [])
+        except Exception as e:
+            logger.warning(f"report_insights_error: {e}")
+            existing_insights = ["Failed to generate existing insights."]
     
-    # Generate comprehensive HTML report
+    ai_generated_insights = []
+    if request.include_insights: # If insights are requested, also include AI insights
+        try:
+            ai_generated_insights = generate_ai_insights(df, analysis_results, existing_insights)
+        except Exception as e:
+            logger.warning(f"report_ai_insights_error: {e}")
+            ai_generated_insights = ["Failed to generate AI insights."]
+
+    # 4. Get News (if included in request)
+    news_articles = []
+    if request.include_news:
+        try:
+            news_articles = await load_news_articles(days=3) # Get last 3 days of news for report
+        except Exception as e:
+            logger.warning(f"report_news_error: {e}")
+            news_articles = []
+            
+    # 5. Generate Charts (if included in request)
+    chart_images: dict[str, bytes] = {}
+    if request.include_charts:
+        try:
+            # Example charts to generate for the report
+            # You can make this configurable or smarter based on dataset
+            if len(df.select_dtypes(include=np.number).columns) >= 2:
+                num_cols = list(df.select_dtypes(include=np.number).columns)
+                if len(num_cols) >= 2:
+                    chart_images["Scatter Plot"] = await generate_chart_image(df, "scatter", num_cols[0], num_cols[1])
+                chart_images["Histogram 1"] = await generate_chart_image(df, "histogram", num_cols[0])
+            elif len(df.columns) > 0: # Fallback for non-numeric or single-column data
+                chart_images["Bar Chart (First Column)"] = await generate_chart_image(df, "bar", df.columns[0], df.columns[0])
+        except Exception as e:
+            logger.error(f"report_chart_generation_error: {e}")
+            chart_images = {"Error": b""} # Empty byte for error
+
+    # 6. Generate comprehensive HTML report
     html_report = await generate_complete_report(
         request.dataset_id,
-        analysis,
-        insights,
+        analysis_results,
+        existing_insights,
+        ai_generated_insights,
         news_articles,
-        cleaned_csv_bytes
+        chart_images,
+        cleaned_csv_bytes # This is still passed but will be attached as a separate file
     )
     
-    # Send via Gmail with attachments
+    # 7. Send via Gmail with attachments
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.service_account import Credentials
@@ -1337,18 +1558,23 @@ async def export_and_send_report(
             if request.include_cleaned_csv:
                 zf.writestr(f"cleaned_data_{request.dataset_id[:8]}.csv", cleaned_csv_bytes)
             zf.writestr(f"analysis_report_{request.dataset_id[:8]}.html", html_report)
+            for chart_name, img_bytes in chart_images.items():
+                if img_bytes: # Only add if image generation was successful
+                    # Ensure chart_name is safe for filename
+                    safe_chart_name = re.sub(r'[\\/:*?"<>|]', '', chart_name)
+                    zf.writestr(f"{safe_chart_name}_{request.dataset_id[:8]}.png", img_bytes)
         
         zip_bytes = zip_buffer.getvalue()
         
         msg = MIMEMultipart()
         msg["to"] = request.recipient_email
         msg["subject"] = request.subject
-        msg.attach(MIMEText("Your complete analysis report is attached.\n\nThe ZIP file contains cleaned data and comprehensive analysis report.", "plain"))
+        msg.attach(MIMEText("Your comprehensive Sairo Insights report is attached. It includes cleaned data, analysis, insights, charts, and news (if requested).", "plain"))
         
         attachment = MIMEBase("application", "octet-stream")
         attachment.set_payload(zip_bytes)
         encoders.encode_base64(attachment)
-        attachment.add_header("Content-Disposition", f"attachment; filename=sairo_analysis_{request.dataset_id[:8]}.zip")
+        attachment.add_header("Content-Disposition", f"attachment; filename=sairo_report_{request.dataset_id[:8]}.zip")
         msg.attach(attachment)
         
         raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -1361,7 +1587,7 @@ async def export_and_send_report(
             "status": "sent",
             "message_id": send_result["id"],
             "recipient": request.recipient_email,
-            "files_included": ["cleaned_data.csv", "analysis_report.html"],
+            "files_included": ["cleaned_data.csv", "analysis_report.html", "charts.png"], # Placeholder for charts
             "archive_size_kb": len(zip_bytes) / 1024
         }
     

@@ -1,0 +1,13 @@
+.git
+.venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.vscode
+.env
+sample_sales.csv
+data/
+logs/

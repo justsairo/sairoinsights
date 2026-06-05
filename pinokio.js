@@ -8,10 +8,13 @@ module.exports = {
   icon: "icon.svg",
   menu: async (kernel, info) => {
     const installing = info.running("install.js")
-    const installed = info.exists("app/backend/env") && info.exists("app/frontend/dist")
-    const running = info.running("start.js")
+    const installed = info.exists("app/backend/env") && info.exists("app/frontend/dist") && info.exists("app/backend-ts/node_modules")
+    const running = info.running("start.js") || info.running("start-ts.js")
     const updating = info.running("update.js")
     const resetting = info.running("reset.js")
+    
+    // Determine which script is running
+    const runningScript = info.running("start.js") ? "start.js" : (info.running("start-ts.js") ? "start-ts.js" : null)
 
     let n8n_url = "http://localhost:5678"
     try {
@@ -43,22 +46,23 @@ module.exports = {
       }]
     }
 
-    if (running) {
-      const local = kernel.memory.local[path.resolve(__dirname, "start.js")]
+    if (running && runningScript) {
+      const local = kernel.memory.local[path.resolve(__dirname, runningScript)]
       const items = []
       if (local && local.url) {
         items.push({
           default: true,
           icon: "fa-solid fa-rocket",
           text: "Open Web UI",
-          href: local.url
+          href: local.url,
+          target: "_blank"
         })
       } else {
         items.push({
           default: true,
           icon: "fa-solid fa-terminal",
           text: "Terminal",
-          href: "start.js"
+          href: runningScript
         })
       }
 
@@ -73,7 +77,7 @@ module.exports = {
         items.push({
           icon: "fa-solid fa-terminal",
           text: "Terminal",
-          href: "start.js"
+          href: runningScript
         })
       }
       return items
@@ -100,8 +104,12 @@ module.exports = {
     const base_menu = [{
       default: true,
       icon: "fa-solid fa-power-off",
-      text: "Start",
+      text: "Start (Python)",
       href: "start.js"
+    }, {
+      icon: "fa-solid fa-bolt",
+      text: "Start (TS Analysis)",
+      href: "start-ts.js"
     }, {
       icon: "fa-solid fa-network-wired",
       text: "Automation (n8n)",
