@@ -58,7 +58,14 @@ STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").lower()
 
 supabase: Client | None = None
 if STORAGE_BACKEND == "supabase" and SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print(f"DEBUG: Supabase client initialized. URL: {SUPABASE_URL}")
+    except Exception as e:
+        print(f"ERROR: Failed to initialize Supabase client: {e}")
+        supabase = None
+else:
+    print(f"DEBUG: Supabase client not initialized. STORAGE_BACKEND: {STORAGE_BACKEND}, URL present: {bool(SUPABASE_URL)}, KEY present: {bool(SUPABASE_KEY)}")
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_ROWS = 100_000
