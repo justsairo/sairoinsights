@@ -938,54 +938,75 @@ class LoginRequest(BaseModel):
 async def signup(request: SignupRequest) -> dict[str, Any]:
     """Sign up with Supabase auth (or local fallback)."""
     print(f"DEBUG: signup called for {request.email}")
-    if not supabase:
-        print("DEBUG: Using local auth for signup")
-        if request.email in USERS:
-            raise HTTPException(status_code=400, detail="User already exists")
-        USERS[request.email] = request.password
-        return {
-            "user": {"id": "local", "email": request.email},
-            "session": {"access_token": f"local_token_{request.email}"},
-            "message": "Signup successful (Local Mode)."
-        }
-    try:
-        print("DEBUG: Using Supabase auth for signup")
-        response = supabase.auth.sign_up({"email": request.email, "password": request.password})
-        return {
-            "user": {"id": response.user.id, "email": response.user.email} if response.user else None,
-            "session": {"access_token": response.session.access_token} if response.session else None,
-            "message": "Signup successful. Please check your email for confirmation."
-        }
-    except Exception as error:
-        logger.error(f"signup_error: {error}")
-        raise HTTPException(status_code=400, detail="Signup failed. Email may already exist.")
+    
+    # Try Supabase if configured
+    if supabase:
+        try:
+            print("DEBUG: Using Supabase auth for signup")
+            response = supabase.auth.sign_up({"email": request.email, "password": request.password})
+            return {
+                "user": {"id": response.user.id, "email": response.user.email} if response.user else None,
+                "session": {"access_token": response.session.access_token} if response.session else None,
+                "message": "Signup successful. Please check your email for confirmation."
+            }
+        except Exception as error:
+            logger.error(f"signup_error: {error}")
+            # If it's a connection error, we fallback to local mode
+            if "getaddrinfo failed" in str(error) or "connection" in str(error).lower():
+                print("DEBUG: Supabase connection failed, falling back to local auth")
+            else:
+                raise HTTPException(status_code=400, detail="Signup failed. Email may already exist.")
+
+    # Local fallback
+    print("DEBUG: Using local auth for signup")
+    if request.email in USERS:
+        raise HTTPException(status_code=400, detail="User already exists")
+    USERS[request.email] = request.password
+    return {
+        "user": {"id": "local", "email": request.email},
+        "session": {"access_token": f"local_token_{request.email}"},
+        "message": "Signup successful (Local Mode)."
+    }
 
 
 @app.post("/api/auth/login")
 async def login(request: LoginRequest) -> dict[str, Any]:
     """Login with Supabase auth (or local fallback)."""
     print(f"DEBUG: login called for {request.email}")
-    if not supabase:
-        print("DEBUG: Using local auth for login")
-        if request.email not in USERS or USERS[request.email] != request.password:
-            print(f"DEBUG: Login failed for {request.email}. User in USERS: {request.email in USERS}")
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        return {
-            "user": {"id": "local", "email": request.email},
-            "session": {"access_token": f"local_token_{request.email}", "refresh_token": "local_refresh_token"},
-        }
-    try:
-        print("DEBUG: Using Supabase auth for login")
-        response = supabase.auth.sign_in_with_password({"email": request.email, "password": request.password})
-        if not response.session:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        return {
-            "user": {"id": response.user.id, "email": response.user.email},
-            "session": {"access_token": response.session.access_token, "refresh_token": response.session.refresh_token},
-        }
-    except Exception as error:
-        logger.error(f"login_error: {error}")
-        raise HTTPException(status_code=401, detail="Login failed. Check your email and password.")
+    
+    # Try Supabase if configured
+    if supabase:
+        try:
+            print("DEBUG: Using Supabase auth for login")
+            response = supabase.auth.sign_in_with_password({"email": request.email, "password": request.password})
+            if response.session:
+                return {
+                    "user": {"id": response.user.id, "email": response.user.email},
+                    "session": {"access_token": response.session.access_token, "refresh_token": response.session.refresh_token},
+                }
+        except Exception as error:
+            logger.error(f"login_error: {error}")
+            # If it's a connection error, we fallback to local mode
+            if "getaddrinfo failed" in str(error) or "connection" in str(error).lower():
+                print("DEBUG: Supabase connection failed, falling back to local auth")
+            else:
+                raise HTTPException(status_code=401, detail="Login failed. Check your email and password.")
+
+    # Local fallback
+    print("DEBUG: Using local auth for login")
+    # Auto-register in local mode for convenience
+    if request.email not in USERS:
+        print(f"DEBUG: Auto-registering {request.email} in local mode")
+        USERS[request.email] = request.password
+        
+    if USERS[request.email] != request.password:
+        print(f"DEBUG: Login failed for {request.email}. Password mismatch.")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+    return {
+        "user": {"id": "local", "email": request.email},
+        "session": {"access_token": f"local_token_{request.email}", "refresh_token": "local_refresh_token"},
+    }
 
 
 @app.post("/api/auth/logout")
@@ -997,16 +1018,24 @@ async def get_current_user_id(authorization: Annotated[str | None, Header()] = N
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid token")
     token = authorization.replace("Bearer ", "")
+    
+    # Check for local token first for development convenience
+    if token.startswith("local_token_"):
+        return "local_user_id"
+
     if not supabase:
-        if token.startswith("local_token_"): # Local fallback for development
-            return "local_user_id"
         raise HTTPException(status_code=401, detail="Supabase not configured, cannot verify token")
+        
     try:
         user = supabase.auth.get_user(token)
         if user and user.user:
             return user.user.id
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-    except Exception:
+    except Exception as error:
+        # Fallback for local tokens even if supabase is configured but unreachable
+        if token.startswith("local_token_"):
+            return "local_user_id"
+        logger.error(f"auth_verify_error: {error}")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 @app.get("/api/auth/verify")
