@@ -1,7 +1,9 @@
 app/backend/env/
 app/backend/data/
+app/backend-ts/node_modules/
 app/frontend/node_modules/
 app/frontend/dist/
 __pycache__/
 *.pyc
 logs/
+.env

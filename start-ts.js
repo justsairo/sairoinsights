@@ -6,8 +6,11 @@ module.exports = {
       params: {
         path: "app/backend-ts",
         message: [
-          "npm start -- --port {{port}}"
+          "npm start"
         ],
+        env: {
+          PORT: "{{port}}"
+        },
         on: [{
           event: "/(http:\\/\\/[0-9.:]+)/",
           done: true

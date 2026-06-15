@@ -24,6 +24,29 @@ import {
 import "./styles.css";
 import DataEditor from './components/DataEditor'; // Import DataEditor
 
+// Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged } from "firebase/auth"; // Add new functions
+
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+// Your web app's Firebase configuration
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyDlV3eLmiPjti2ZzpoA_AW2ZTpqa3_6884",
+  authDomain: "lucky-1af7d.firebaseapp.com",
+  projectId: "lucky-1af7d",
+  storageBucket: "lucky-1af7d.firebasestorage.app",
+  messagingSenderId: "124258606597",
+  appId: "1:124258606597:web:794875d7f9a3f95ccd066c",
+  measurementId: "G-R7FWK25XVZ"
+};
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
+const auth = getAuth(app); // Initialize Firebase Auth
+
 const API = (typeof process !== 'undefined' && process.env && process.env.REACT_APP_API_URL) || "";
 const steps = ["Create Data", "Upload", "Clean", "Analyze", "Visualize", "Insights", "News", "Automation"];
 
@@ -78,21 +101,35 @@ function AuthPage({ setUser, config }) {
     }
 
     try {
-      const endpoint = isLogin ? "/api/auth/login" : "/api/auth/signup";
-      const response = await fetch(`${API}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
-      const data = await response.json();
+      let userCredential;
+      if (API === "") { // Use Firebase if no backend API is configured
+        if (isLogin) {
+          userCredential = await signInWithEmailAndPassword(auth, email, password);
+        } else {
+          userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        }
+        const user = userCredential.user;
+        const token = await user.getIdToken();
+        localStorage.setItem("auth_token", token);
+        localStorage.setItem("user_email", user.email);
+        setUser({ email: user.email });
+      } else { // Use existing backend API
+        const endpoint = isLogin ? "/api/auth/login" : "/api/auth/signup";
+        const response = await fetch(`${API}${endpoint}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await response.json();
 
-      if (!response.ok) {
-        throw new Error(data.detail || "Authentication failed");
+        if (!response.ok) {
+          throw new Error(data.detail || "Authentication failed");
+        }
+
+        localStorage.setItem("auth_token", data.session.access_token);
+        localStorage.setItem("user_email", email);
+        setUser({ email });
       }
-
-      localStorage.setItem("auth_token", data.session.access_token);
-      localStorage.setItem("user_email", email);
-      setUser({ email });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -262,11 +299,34 @@ function App() {
   const active = cleaned || dataset;
 
   useEffect(() => {
-    const token = localStorage.getItem("auth_token");
-    const userEmail = localStorage.getItem("user_email");
-    if (token && userEmail) {
-      setUser({ email: userEmail });
+    // Check local storage for existing session OR listen to Firebase auth state changes
+    if (API !== "") { // Only use local storage for token if backend API is used
+      const token = localStorage.getItem("auth_token");
+      const userEmail = localStorage.getItem("user_email");
+      if (token && userEmail) {
+        setUser({ email: userEmail });
+      }
     }
+
+    // Always listen to Firebase auth state changes if API is empty
+    if (API === "") {
+      const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+        if (firebaseUser) {
+          // User is signed in.
+          const token = await firebaseUser.getIdToken();
+          localStorage.setItem("auth_token", token);
+          localStorage.setItem("user_email", firebaseUser.email);
+          setUser({ email: firebaseUser.email });
+        } else {
+          // User is signed out.
+          localStorage.removeItem("auth_token");
+          localStorage.removeItem("user_email");
+          setUser(null);
+        }
+      });
+      return () => unsubscribe(); // Clean up the subscription
+    }
+
     request("/api/config").then(setConfig).catch(() => {});
   }, []);
 

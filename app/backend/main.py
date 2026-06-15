@@ -93,14 +93,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
-        "ALLOWED_ORIGINS",
-        "http://127.0.0.1:8000,http://localhost:8000,http://127.0.0.1:5173,http://localhost:5173",
-    ).split(",")
-    if origin.strip()
-]
+ALLOWED_ORIGINS = ["*"]
 
 RSS_SOURCES = [
     {"url": "https://feeds.reuters.com/reuters/businessNews", "name": "Reuters Business", "category": "markets"},

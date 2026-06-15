@@ -1,4 +1,5 @@
 import express from 'express';
+import path from 'path';
 import multer from 'multer';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -6,6 +7,8 @@ import { v4 as uuidv4 } from 'uuid';
 import * as math from 'mathjs';
 import * as ss from 'simple-statistics';
 import { DatasetRecord, AnalyzeRequest } from './types';
+import fs from 'fs'; // Import fs module
+import { parse } from 'csv-parse/sync'; // Import parse for CSV
 
 dotenv.config();
 
@@ -16,7 +19,23 @@ app.use(cors());
 app.use(express.json());
 
 const DATASETS: Map<string, DatasetRecord> = new Map();
-const USERS: Map<string, string> = new Map();
+const USERS_FILE = path.resolve(__dirname, 'users.json');
+let USERS: Map<string, string> = new Map();
+
+// Load users from file
+function loadUsers() {
+  if (fs.existsSync(USERS_FILE)) {
+    const data = fs.readFileSync(USERS_FILE, 'utf-8');
+    USERS = new Map(JSON.parse(data));
+  }
+}
+
+// Save users to file
+function saveUsers() {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(Array.from(USERS.entries())));
+}
+
+loadUsers(); // Load users on startup
 
 // Multer for file uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -39,6 +58,7 @@ app.post('/api/auth/signup', (req, res) => {
   const { email, password } = req.body;
   if (USERS.has(email)) return res.status(400).json({ detail: 'User already exists' });
   USERS.set(email, password);
+  saveUsers(); // Save users after signup
   res.json({
     user: { id: 'local', email },
     session: { access_token: `local_token_${email}` },
@@ -178,7 +198,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   }
 
   const id = uuidv4();
-  const columns = data.length > 0 ? Object.keys(data[0]) : [];
+  const columns = data.length > 0 ? Object.keys(data[0] as any) : [];
   DATASETS.set(id, { data, columns, accessToken: 'local_token' });
 
   res.json({
@@ -186,8 +206,9 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     dataset_token: 'local_token',
     columns,
     rows: data.length,
-    preview: data.slice(0, 5)
+    preview: Array.isArray(data) ? data.slice(0, 5) : []
   });
+
 });
 
 app.post('/api/analyze', (req, res) => {
@@ -284,9 +305,6 @@ app.post('/api/analyze', (req, res) => {
   }
 });
 
-// Helper for initial sample data
-import fs from 'fs';
-import { parse } from 'csv-parse/sync';
 
 app.get('/api/sample', (req, res) => {
   const csvPath = '../backend/sample_sales.csv';
@@ -294,7 +312,7 @@ app.get('/api/sample', (req, res) => {
     const fileContent = fs.readFileSync(csvPath, 'utf-8');
     const records = parse(fileContent, { columns: true, cast: true });
     const id = uuidv4();
-    const columns = Object.keys(records[0]);
+    const columns = records[0] ? Object.keys(records[0] as any) : [];
     DATASETS.set(id, { data: records, columns, accessToken: 'local_token' });
     
     res.json({
@@ -308,6 +326,22 @@ app.get('/api/sample', (req, res) => {
     res.status(404).json({ detail: 'Sample data not found' });
   }
 });
+
+// Serve frontend
+const FRONTEND_DIST = path.resolve(__dirname, '../../frontend/dist');
+if (fs.existsSync(FRONTEND_DIST)) {
+  app.use(express.static(FRONTEND_DIST)); // Serve static files
+  app.get('*', (req, res) => { // Fallback to index.html for all other routes
+    if (req.path.startsWith('/api')) { // API routes should not be handled by frontend fallback
+      return res.status(404).json({ detail: 'Not found' });
+    }
+    const indexHtmlPath = path.join(FRONTEND_DIST, 'index.html');
+    if (fs.existsSync(indexHtmlPath)) {
+      return res.sendFile(indexHtmlPath);
+    }
+    res.json({ message: "Frontend has not been built. Run npm install && npm run build in app/frontend." });
+  });
+}
 
 app.listen(port, () => {
   console.log(`TypeScript Backend running at http://localhost:${port}`);

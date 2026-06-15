@@ -1,5 +1,8 @@
 {
   "title": "Sairo Insights",
   "description": "Local MVP for upload, cleaning, analysis, visualization, and automatic dataset insights.",
-  "icon": "icon.svg"
+  "icon": "icon.svg",
+  "plugin": {
+    "menu": []
+  }
 }
