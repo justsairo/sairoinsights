@@ -1342,6 +1342,67 @@ def generate_ai_insights(df: pd.DataFrame, analysis_results: dict[str, Any], exi
     final_insights = list(set(existing_insights + ai_insights))
     return final_insights[:8] # Limit AI insights to a reasonable number to avoid clutter
 
+
+def generate_future_estimates(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """
+    Generates simple future estimates for suitable numerical columns using linear regression.
+    Assumes the DataFrame index can represent a time-like sequence.
+    """
+    estimates = []
+    
+    # Try to use DataFrame index as time if it's numeric or convertible
+    time_series_candidate = None
+    if isinstance(df.index, pd.DatetimeIndex):
+        time_series_candidate = np.arange(len(df.index))
+    elif pd.api.types.is_numeric_dtype(df.index):
+        time_series_candidate = df.index.to_numpy()
+    
+    if time_series_candidate is None:
+        # Fallback to a simple sequential index if no clear time index
+        time_series_candidate = np.arange(len(df))
+
+    if len(time_series_candidate) < 2:
+        return [] # Not enough data for meaningful regression
+
+    numeric_cols = list(df.select_dtypes(include=np.number).columns)
+    
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if len(series) < 2:
+            continue
+
+        # Align time_series_candidate with available series data
+        if isinstance(df.index, pd.DatetimeIndex) or pd.api.types.is_numeric_dtype(df.index):
+            X = time_series_candidate[series.index.map(df.index.get_loc).to_numpy()].reshape(-1, 1)
+        else:
+            X = time_series_candidate[series.index.to_numpy()].reshape(-1, 1)
+        y = series.to_numpy()
+
+        if len(X) < 2: # Need at least 2 points for linear regression
+            continue
+
+        model = LinearRegression()
+        try:
+            model.fit(X, y)
+
+            last_time_point = X[-1][0]
+            future_time_points = np.array([last_time_point + i for i in range(1, 6)]).reshape(-1, 1) # Forecast 5 steps
+            future_predictions = model.predict(future_time_points)
+
+            estimates.append({
+                "column": col,
+                "model_type": "Linear Regression",
+                "trend_coefficient": float(model.coef_[0]),
+                "last_observed_value": float(y[-1]),
+                "future_estimates_5_steps": [float(p) for p in future_predictions],
+                "insight": f"Predicted {col} to {'increase' if model.coef_[0] > 0 else 'decrease'} over the next 5 steps based on linear trend."
+            })
+        except Exception as e:
+            logger.warning(f"future_estimate_error_for_col_{col}: {e}")
+            
+    return estimates
+
+
 class ExportCompleteReportRequest(BaseModel):
     dataset_id: str
     recipient_email: str
@@ -1350,17 +1411,20 @@ class ExportCompleteReportRequest(BaseModel):
     include_charts: bool = True # New field
     include_insights: bool = True
     include_news: bool = True
+    include_future_estimates: bool = True # New field for future estimates
     subject: str = "Sairo Insights - Complete Analysis Report"
+
 
 
 async def generate_complete_report(
     dataset_id: str, 
     analysis: dict[str, Any] | None,
     insights: list[str] | None,
-    ai_insights: list[str] | None, # New parameter
+    ai_insights: list[str] | None,
+    future_estimates: list[dict[str, Any]] | None, # New parameter
     news_articles: list[dict] | None,
-    chart_images: dict[str, bytes] | None, # New parameter
-    cleaned_csv_bytes: bytes | None # Keeping for zip attachment, not direct HTML embed
+    chart_images: dict[str, bytes] | None,
+    cleaned_csv_bytes: bytes | None
 ) -> bytes:
     """Generate a comprehensive HTML report with all analysis outputs."""
     from datetime import datetime
@@ -1382,6 +1446,7 @@ async def generate_complete_report(
                 th {{ background: #f0f0f0; font-weight: 600; }}
                 .insight {{ background: #e3f2fd; border-left: 4px solid #2196f3; padding: 15px; margin: 10px 0; border-radius: 4px; }}
                 .ai-insight {{ background: #e0ffe0; border-left: 4px solid #4CAF50; padding: 15px; margin: 10px 0; border-radius: 4px; }}
+                .future-estimate {{ background: #fff3e0; border-left: 4px solid #ff9800; padding: 15px; margin: 10px 0; border-radius: 4px; }}
                 .chart-container {{ text-align: center; margin: 20px 0; }}
                 .news-item {{ background: #f3e5f5; border-left: 4px solid #9c27b0; padding: 12px; margin: 8px 0; border-radius: 4px; }}
                 .footer {{ text-align: center; color: #999; font-size: 12px; margin-top: 40px; }}
@@ -1432,6 +1497,31 @@ async def generate_complete_report(
         """)
         for insight in ai_insights:
             html_parts.append(f'<div class="ai-insight">{html.escape(insight)}</div>')
+        html_parts.append("</div>")
+
+    if future_estimates:
+        html_parts.append("""
+            <div class="section">
+                <h2>🔮 Future Estimates</h2>
+        """)
+        for estimate in future_estimates:
+            col = html.escape(estimate.get("column", "N/A"))
+            model_type = html.escape(estimate.get("model_type", "N/A"))
+            trend = estimate.get("trend_coefficient", 0)
+            last_val = estimate.get("last_observed_value", "N/A")
+            future_vals = ", ".join([f"{v:.2f}" for v in estimate.get("future_estimates_5_steps", [])])
+            insight_text = html.escape(estimate.get("insight", ""))
+
+            html_parts.append(f"""
+                <div class="future-estimate">
+                    <h3>Column: {col}</h3>
+                    <p><strong>Model:</strong> {model_type}</p>
+                    <p><strong>Trend Coefficient:</strong> {trend:.4f}</p>
+                    <p><strong>Last Observed:</strong> {last_val:.2f}</p>
+                    <p><strong>Next 5 Steps Estimate:</strong> {future_vals}</p>
+                    <p><em>Insight:</em> {insight_text}</p>
+                </div>
+            """)
         html_parts.append("</div>")
 
     if chart_images:
@@ -1522,7 +1612,16 @@ async def export_and_send_report(
             logger.warning(f"report_ai_insights_error: {e}")
             ai_generated_insights = ["Failed to generate AI insights."]
 
-    # 4. Get News (if included in request)
+    # 4. Generate Future Insights and Estimates (if included in request)
+    future_estimates = []
+    if request.include_future_estimates:
+        try:
+            future_estimates = generate_future_estimates(df)
+        except Exception as e:
+            logger.warning(f"report_future_estimates_error: {e}")
+            future_estimates = ["Failed to generate future estimates."]
+
+    # 5. Get News (if included in request)
     news_articles = []
     if request.include_news:
         try:
@@ -1531,7 +1630,7 @@ async def export_and_send_report(
             logger.warning(f"report_news_error: {e}")
             news_articles = []
             
-    # 5. Generate Charts (if included in request)
+    # 6. Generate Charts (if included in request)
     chart_images: dict[str, bytes] = {}
     if request.include_charts:
         try:
@@ -1539,27 +1638,30 @@ async def export_and_send_report(
             # You can make this configurable or smarter based on dataset
             if len(df.select_dtypes(include=np.number).columns) >= 2:
                 num_cols = list(df.select_dtypes(include=np.number).columns)
+                # Generate a scatter plot for the first two numeric columns
                 if len(num_cols) >= 2:
-                    chart_images["Scatter Plot"] = await generate_chart_image(df, "scatter", num_cols[0], num_cols[1])
-                chart_images["Histogram 1"] = await generate_chart_image(df, "histogram", num_cols[0])
+                    chart_images[f"Scatter Plot: {num_cols[0]} vs {num_cols[1]}"] = await generate_chart_image(df, "scatter", num_cols[0], num_cols[1])
+                # Generate a histogram for the first numeric column
+                chart_images[f"Histogram: {num_cols[0]}"] = await generate_chart_image(df, "histogram", num_cols[0])
             elif len(df.columns) > 0: # Fallback for non-numeric or single-column data
-                chart_images["Bar Chart (First Column)"] = await generate_chart_image(df, "bar", df.columns[0], df.columns[0])
+                chart_images[f"Bar Chart: {df.columns[0]}"] = await generate_chart_image(df, "bar", df.columns[0], df.columns[0])
         except Exception as e:
             logger.error(f"report_chart_generation_error: {e}")
             chart_images = {"Error": b""} # Empty byte for error
 
-    # 6. Generate comprehensive HTML report
+    # 7. Generate comprehensive HTML report
     html_report = await generate_complete_report(
         request.dataset_id,
         analysis_results,
         existing_insights,
         ai_generated_insights,
+        future_estimates, # Pass future estimates
         news_articles,
         chart_images,
         cleaned_csv_bytes # This is still passed but will be attached as a separate file
     )
     
-    # 7. Send via Gmail with attachments
+    # 8. Send via Gmail with attachments
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.service_account import Credentials
@@ -1598,7 +1700,7 @@ async def export_and_send_report(
         msg = MIMEMultipart()
         msg["to"] = request.recipient_email
         msg["subject"] = request.subject
-        msg.attach(MIMEText("Your comprehensive Sairo Insights report is attached. It includes cleaned data, analysis, insights, charts, and news (if requested).", "plain"))
+        msg.attach(MIMEText("Your comprehensive Sairo Insights report is attached. It includes cleaned data, analysis, insights, charts, future estimates, and news (if requested).", "plain"))
         
         attachment = MIMEBase("application", "octet-stream")
         attachment.set_payload(zip_bytes)
@@ -1624,78 +1726,6 @@ async def export_and_send_report(
         logger.error(f"export_report_error: {error}")
         raise HTTPException(status_code=500, detail=f"Failed to send report: {str(error)}")
 
-
-async def send_via_gmail(recipient: str, subject: str, message: str, csv_bytes: bytes, filename: str) -> dict[str, Any]:
-    """Send cleaned dataset via Gmail using OAuth2."""
-    try:
-       from google.auth.transport.requests import Request
-       from google.oauth2.service_account import Credentials
-       from googleapiclient.discovery import build
-       from googleapiclient.errors import HttpError
-       from email.mime.base import MIMEBase
-       from email import encoders
-       import base64
-
-       gmail_service_account = os.getenv("GMAIL_SERVICE_ACCOUNT_JSON")
-       if not gmail_service_account:
-           raise HTTPException(status_code=500, detail="Gmail not configured (set GMAIL_SERVICE_ACCOUNT_JSON)")
-
-       try:
-           sa_info = json.loads(gmail_service_account)
-       except json.JSONDecodeError:
-           sa_info = json.loads(Path(gmail_service_account).read_text())
-
-       creds = Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/gmail.send"])
-       service = build("gmail", "v1", credentials=creds)
-
-       msg = MIMEMultipart()
-       msg["to"] = recipient
-       msg["subject"] = subject
-       msg.attach(MIMEText(message, "plain"))
-
-       attachment = MIMEBase("application", "octet-stream")
-       attachment.set_payload(csv_bytes)
-       encoders.encode_base64(attachment)
-       attachment.add_header("Content-Disposition", f"attachment; filename={filename}")
-       msg.attach(attachment)
-
-       raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-       send_message = {"raw": raw_message}
-
-       send_result = service.users().messages().send(userId="me", body=send_message).execute()
-       logger.info("gmail_sent", extra={"event": "gmail_sent", "recipient": recipient, "message_id": send_result["id"]})
-       return {"status": "sent", "message_id": send_result["id"], "recipient": recipient}
-
-    except HttpError as error:
-       logger.error(f"gmail_send_failed: {error}")
-       raise HTTPException(status_code=500, detail=f"Failed to send via Gmail: {str(error)}")
-    except Exception as error:
-       logger.error(f"gmail_error: {error}")
-       raise HTTPException(status_code=500, detail="Gmail integration error")
-
-
-@app.post("/api/send-cleaned-via-gmail")
-async def send_cleaned_via_gmail(
-    request: SendViaGmailRequest, 
-    user_id: Annotated[str, Depends(get_current_user_id)],
-    x_dataset_token: str | None = Header(default=None)
-) -> dict[str, Any]:
-    """Send cleaned dataset via Gmail after cleaning."""
-    df = get_dataset(request.dataset_id, user_id, x_dataset_token)
-    
-    csv_buffer = io.StringIO()
-    df.to_csv(csv_buffer, index=False)
-    csv_bytes = csv_buffer.getvalue().encode("utf-8")
-    
-    filename = f"cleaned_dataset_{request.dataset_id[:8]}.csv"
-    result = await send_via_gmail(
-       recipient=request.recipient_email,
-       subject=request.subject,
-       message=request.message,
-       csv_bytes=csv_bytes,
-       filename=filename
-    )
-    return result
 
 
 @app.post("/api/news/collect", response_model=NewsCollectResponse)

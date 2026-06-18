@@ -474,10 +474,6 @@ function CleanStep({ dataset, request, setCleaned, setStep }) {
   const [missing, setMissing] = useState("none");
   const [removeDuplicates, setRemoveDuplicates] = useState(true);
   const [outlierMethod, setOutlierMethod] = useState("none");
-  const [gmailRecipient, setGmailRecipient] = useState("");
-  const [gmailSubject, setGmailSubject] = useState("Cleaned Dataset");
-  const [gmailMessage, setGmailMessage] = useState("Here is your cleaned dataset.");
-  const [cleanedLocal, setCleanedLocal] = useState(null);
   if (!dataset) return <EmptyState />;
 
   async function clean() {
@@ -492,27 +488,7 @@ function CleanStep({ dataset, request, setCleaned, setStep }) {
         outlier_method: outlierMethod
       })
     });
-    setCleanedLocal(payload);
     setCleaned(payload);
-  }
-
-  async function sendViaGmail() {
-    if (!gmailRecipient) {
-      alert("Please enter a recipient email");
-      return;
-    }
-    const result = await request("/api/send-cleaned-via-gmail", {
-      method: "POST",
-      datasetToken: cleanedLocal.dataset_token || dataset.dataset_token,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        dataset_id: cleanedLocal.dataset_id || dataset.dataset_id,
-        recipient_email: gmailRecipient,
-        subject: gmailSubject,
-        message: gmailMessage
-      })
-    });
-    alert("Email sent successfully!");
   }
 
   return (
@@ -540,40 +516,6 @@ function CleanStep({ dataset, request, setCleaned, setStep }) {
         </Control>
       </div>
       <button onClick={clean} className="btn-primary">Apply cleaning</button>
-      
-      {cleanedLocal && (
-        <div className="rounded-md border border-blue-200 bg-blue-50 p-4 space-y-3">
-          <h3 className="font-semibold text-blue-900 flex items-center gap-2">
-            <Send size={18} /> Send Cleaned Data via Gmail
-          </h3>
-          <Control label="Recipient Email">
-            <input 
-              type="email" 
-              value={gmailRecipient} 
-              onChange={(e) => setGmailRecipient(e.target.value)} 
-              placeholder="recipient@example.com"
-              className="input"
-            />
-          </Control>
-          <Control label="Subject">
-            <input 
-              type="text" 
-              value={gmailSubject} 
-              onChange={(e) => setGmailSubject(e.target.value)} 
-              className="input"
-            />
-          </Control>
-          <Control label="Message">
-            <textarea 
-              value={gmailMessage} 
-              onChange={(e) => setGmailMessage(e.target.value)} 
-              className="input h-24"
-              placeholder="Your message here..."
-            />
-          </Control>
-          <button onClick={sendViaGmail} className="btn-primary">Send via Gmail</button>
-        </div>
-      )}
       
       <Preview dataset={cleanedLocal || dataset} />
     </div>
@@ -760,9 +702,10 @@ function AutomationStep({ dataset, request, insights, news }) {
   const [exportStatus, setExportStatus] = useState("");
   const [includeCleanedCsv, setIncludeCleanedCsv] = useState(true);
   const [includeAnalysis, setIncludeAnalysis] = useState(true);
-  const [includeCharts, setIncludeCharts] = useState(true); // New state for charts
+  const [includeCharts, setIncludeCharts] = useState(true);
   const [includeInsights, setIncludeInsights] = useState(true);
   const [includeNews, setIncludeNews] = useState(true);
+  const [includeFutureEstimates, setIncludeFutureEstimates] = useState(true); // New state for future estimates
   const [config, setConfig] = useState({ n8n_url: "http://localhost:5678", automation_enabled: false });
 
   useEffect(() => {
@@ -785,9 +728,10 @@ function AutomationStep({ dataset, request, insights, news }) {
           recipient_email: exportEmail,
           include_cleaned_csv: includeCleanedCsv,
           include_analysis: includeAnalysis,
-          include_charts: includeCharts, // New field
+          include_charts: includeCharts,
           include_insights: includeInsights,
           include_news: includeNews && !!news.articles?.length, // Only if news articles exist
+          include_future_estimates: includeFutureEstimates, // New field
           subject: "Sairo Insights - Complete Analysis Report"
         })
       });
@@ -809,7 +753,7 @@ function AutomationStep({ dataset, request, insights, news }) {
           <h3 className="font-semibold text-blue-900 flex items-center gap-2">
             <Send size={20} /> Export & Send Complete Report via Gmail
           </h3>
-          <p className="text-sm text-blue-800">Send all generated outputs (cleaned data, analysis, insights, news) as a ZIP archive.</p>
+          <p className="text-sm text-blue-800">Send all generated outputs (cleaned data, analysis, insights, charts, future estimates, and news) as a ZIP archive.</p>
           <div className="flex flex-col gap-2">
             <input 
               type="email" 
@@ -824,6 +768,7 @@ function AutomationStep({ dataset, request, insights, news }) {
               <label className="flex items-center gap-2"><input type="checkbox" checked={includeCharts} onChange={(e) => setIncludeCharts(e.target.checked)} /> Include Charts</label>
               <label className="flex items-center gap-2"><input type="checkbox" checked={includeInsights} onChange={(e) => setIncludeInsights(e.target.checked)} /> Include Insights</label>
               <label className="flex items-center gap-2"><input type="checkbox" checked={includeNews} onChange={(e) => setIncludeNews(e.target.checked)} /> Include News</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={includeFutureEstimates} onChange={(e) => setIncludeFutureEstimates(e.target.checked)} /> Include Future Estimates</label>
             </div>
             <button onClick={exportAndSendReport} className="btn-primary mt-2">Send Report</button>
           </div>
