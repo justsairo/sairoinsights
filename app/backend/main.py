@@ -1619,7 +1619,7 @@ async def export_and_send_report(
             future_estimates = generate_future_estimates(df)
         except Exception as e:
             logger.warning(f"report_future_estimates_error: {e}")
-            future_estimates = ["Failed to generate future estimates."]
+            future_estimates = []
 
     # 5. Get News (if included in request)
     news_articles = []
